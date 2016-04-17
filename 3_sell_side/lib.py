@@ -14,7 +14,7 @@ AUTH_HEADER = {
 }
 
 
-class OrderError(Exception):
+class APIResponseError(Exception):
     def __init__(self, status_code, error_msg=None):
         self.status_code = status_code
         self.error_msg = error_msg
@@ -34,6 +34,10 @@ class StockPurse:
         self._closed_bids = {}
 
 
+    def value(self):
+        return self._basis + (self._last_fill_price * self._stocks_held)
+
+
     def basis(self):
         return self._basis
 
@@ -46,12 +50,12 @@ class StockPurse:
         resp = buy(self._venue, self._stock, self._account, type, qty, price)
         
         if resp.status_code != 200:
-            raise OrderError(resp.status_code)
+            raise APIResponseError(resp.status_code)
 
         resp_json = resp.json()
 
         if not resp_json['ok']:
-            raise OrderError(resp.status_code, resp_json['error'])
+            raise APIResponseError(resp.status_code, resp_json['error'])
         
         # Update internal values
         self._stocks_held += resp_json['totalFilled']
@@ -74,12 +78,12 @@ class StockPurse:
         resp = sell(self._venue, self._stock, self._account, type, qty, price)
         
         if resp.status_code != 200:
-            raise OrderError(resp.status_code)
+            raise APIResponseError(resp.status_code)
 
         resp_json = resp.json()
 
         if not resp_json['ok']:
-            raise OrderError(resp.status_code, resp_json['error'])
+            raise APIResponseError(resp.status_code, resp_json['error'])
         
         # Update internal values
         self._stocks_held -= resp_json['totalFilled']
@@ -124,12 +128,12 @@ class StockPurse:
         resp = delete(self._venue, self._stock, id)
 
         if resp.status_code != 200:
-            raise OrderError(resp.status_code)
+            raise APIResponseError(resp.status_code)
 
         resp_json = resp.json()
 
         if not resp_json['ok']:
-            raise OrderError(resp.status_code, resp_json['error'])
+            raise APIResponseError(resp.status_code, resp_json['error'])
 
         # Update internal values
         qty_diff = resp_json['totalFilled'] - order_to_cancel['totalFilled']
@@ -165,17 +169,34 @@ class StockPurse:
         resp = quote(self._venue, self._stock)
 
         if resp.status_code != 200:
-            raise OrderError(resp.status_code)
+            raise APIResponseError(resp.status_code)
 
         resp_json = resp.json()
 
         if not resp_json['ok']:
-            raise OrderError(resp.status_code, resp_json['error'])
+            raise APIResponseError(resp.status_code, resp_json['error'])
 
         # Update internal values
         self._last_fill_price = resp_json['last']
 
         return resp_json
+
+
+    def orderbook(self):
+        resp = orderbook(self._venue, self._stock)
+
+        if resp.status_code != 200:
+            raise APIResponseError(resp.status_code)
+
+        resp_json = resp.json()
+
+        if not resp_json['ok']:
+            raise APIResponseError(resp.status_code, resp_json['error'])
+
+        # No internal value to update
+        
+        return resp_json
+
 
 
 def quote(venue, stock):
