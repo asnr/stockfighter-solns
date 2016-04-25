@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+import logging
 import requests
 
 def get_auth_key():
@@ -54,7 +55,11 @@ class APISession:
         if price is not None:
             body['price'] = price
 
-        return(self._session.post(url, json=body, headers=AUTH_HEADER))
+        resp = self._session.post(url, json=body, headers=AUTH_HEADER)
+
+        logging.debug(resp.text)
+
+        return resp
 
     def cancel_order(self, venue, stock, order):
         url = ('{}/venues/{}/stocks/{}/orders/{}'
@@ -130,7 +135,7 @@ class StockPurse:
         if last_fill_price is not None:
             self._last_fill_price = last_fill_price
 
-        self._orders[buy_order.id] = order
+        self._orders[order.id] = order
 
         if order.is_ask():
             if order.is_open():
@@ -143,7 +148,7 @@ class StockPurse:
             else:
                 self._closed_bids.add(order.id)
 
-        return buy_order
+        return order
 
 
     def buy(self, type, qty, price=None):
@@ -155,11 +160,10 @@ class StockPurse:
 
 
     def cancel_all(self):
-        ret = {'asks': {}, 'bids': {}}
-        for id in self._open_bids:
-            ret['bids'][id] = self.cancel(id)
-        for id in self._open_asks:
-            ret['asks'][id] = self.cancel(id)
+        ret = {}
+        open_orders = list(self._open_bids) + list(self._open_asks)
+        for id in open_orders:
+            ret[id] = self.cancel(id)
 
         return ret
 
@@ -192,10 +196,10 @@ class StockPurse:
             pass
 
         if order_to_cancel.is_ask():
-            del self._open_asks[id]
+            self._open_asks.remove(id)
             self._closed_asks.add(id)
         else:
-            del self._open_bids[id]
+            self._open_bids.remove(id)
             self._closed_bids.add(id)
             
         return order_to_cancel
@@ -228,40 +232,71 @@ class Order:
             ['ok', 'id', 'ts', 'account', 'venue', 'symbol', 'direction',
              'orderType', 'originalQty', 'qty', 'price', 'fills',
              'totalFilled', 'open'])
+    expected_fill_keys = set(['price', 'qty', 'ts'])
 
     def __init__(self, req_venue, req_stock, req_account, req_direction,
                  req_type, req_qty, req_price, request_time, resp_json):
         # Validate response against request
+        log_req_and_resp = False
         if req_account != resp_json['account']:
-            pass
-        #resp_json['venue']
-        #resp_json['symbol']
+            print('Request account "{}" does not match response account "{}". See WARNING in logs.'.
+                  format(req_account, resp_json['account']))
+            log_req_and_resp = True
         if req_direction != resp_json['direction']:
-            pass
+            print('Request direction "{}" does not match response direction "{}". See WARNING in logs.'.
+                  format(req_direction, resp_json['direction']))
+            log_req_and_resp = True
         if req_qty != resp_json['originalQty']:
-            pass
+            print('Request qty "{}" does not match response originalQty "{}". See WARNING in logs.'.
+                  format(req_qty, resp_json['originalQty']))
+            log_req_and_resp = True
         if req_price != resp_json['price']:
-            pass
+            print('Request price "{}" does not match response price "{}". See WARNING in logs.'.
+                  format(req_price, resp_json['price']))
+            log_req_and_resp = True
         if req_type != resp_json['orderType']:
-            pass
+            print('Request type "{}" does not match response type "{}". See WARNING in logs.'.
+                  format(req_type, resp_json['type']))
+            log_req_and_resp = True
         #resp_json['ts']
 
         # Check internal consistency of response
+        log_resp = False
         sum_fill_qtys = sum(f['qty'] for f in resp_json['fills'])
         if resp_json['totalFilled'] != sum_fill_qtys:
-            # log
-            pass
-        # check qty_outstanding
+            print('Response totalFilled {} does not match sum of fill qtys {}. See WARNING in logs.'
+                  .format(resp_json['totalFilled'], sum_fill_qtys))
+            log_resp = True
+        if resp_json['qty'] != resp_json['originalQty'] - sum_fill_qtys:
+            print('Response qty {} is not equal to originalQty - sum of fill qtys {}. See WARNING in logs.'
+                  .format(resp_json['qty'], resp_json['originalQty'] - sum_fill_qtys))
+            log_resp = True
 
         # Check response doesn't contain extra data, for now only check top
         # level keys.
         unexpected_keys = [key for key in resp_json
                            if key not in self.expected_top_keys]
         if len(unexpected_keys) > 0:
-            pass
+            print('Response has unexpected_keys {}. See WARNING in logs.'
+                  .format(', '.join(unexpected_keys)))
+            log_resp = True
+
+        if log_req_and_resp:
+            logging.warning(
+                ('request and response mismatch.\n'
+                 'Request params:\n  venue: %s\n  stock: %s\n  account: %s\n',
+                 '  direction: %s\n  type: %s\n  quantity: %s\n  price:  %s\n\n',
+                 'Response JSON:\n%s'),
+                req_venue, req_stock, req_account, req_direction, req_type,
+                req_qty, req_price,
+                json.dumps(resp_json, indent=4, separators=(',', ': ')))
+        elif log_resp:
+            logging.warning(
+                'response inconsistent.\nResponse JSON:\n%s',
+                json.dumps(resp_json, indent=4, separators=(',', ': ')))
 
         self.id = resp_json['id']
-        self.req_time = req_time
+        #self.req_time = req_time
         self.server_order_time = resp_json['ts']
 
         self.symbol = resp_json['symbol']
@@ -269,7 +304,6 @@ class Order:
         self.direction = resp_json['direction']
         self.type = resp_json['orderType']
         self.qty = resp_json['originalQty']
-        #self.qty_outstanding = resp_json['qty']
         self.price = resp_json['price']
         self.account = resp_json['account']
         self.fills = resp_json['fills']

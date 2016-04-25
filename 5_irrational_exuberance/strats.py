@@ -1,5 +1,11 @@
 from __future__ import print_function
 
+import logging
+
+import httplib
+# There are only two debuglevel values: zero and positive
+#httplib.HTTPConnection.debuglevel = 1
+
 import time
 
 from ws4py.client.threadedclient import WebSocketClient
@@ -7,9 +13,14 @@ import json
 
 from lib import *
 
-account = 'BM39645077'
-venue = 'WVIOEX'
-stock = 'UZYU'
+logging.basicConfig(
+    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s:%(message)s',
+    datefmt='%H:%M:%S', level=logging.INFO, filename='logs')
+
+
+account = 'EKB17478089'
+venue = 'ZXMCEX'
+stock = 'WIOM'
 
 init_position = 0
 init_basis = 0
@@ -17,10 +28,53 @@ purse = StockPurse(
     venue, stock, account, position=init_position, basis=init_basis)
 
 
-def crash_maker(stock_purse, orig_value=None, num_rounds=30, wait_secs=4, qty_tolerance=400,
-              tolerance_adjust=1000, qty_marks=(1000, 2000, 10000, 30000, 50000),
-              price_delta_fallback=400, qtys=(100, 200, 200, 200, 100),
-              informed_qty=10000, informed_penalty=400, dont_stop=True):
+def slow_buyer(stock_purse, target_position=-6000, qty=300, price_delta=150,
+               wait_before_cancel=5, wait_after_cancel=2):
+    """Try to sell lots of stock before crashing the price.
+
+    To not crash the stock, sell `qty` at `price_delta` below top bid
+    on orderbook. Wait `wait_before_cancel`, then cancel, then wait
+    `wait_after_cancel`.
+
+    Once we hit `target_position`, stop."""
+
+    round_num = 0
+    while(target_position < stock_purse.position()):
+
+        round_num += 1
+        print('')
+        print('###### Slow buy, round {} ######'.format(round_num))
+        print('')
+
+        probe_book = get_probe_orderbook(
+            stock_purse, max_retries=10, pause=0.6, require_asks=False)
+
+        ask_price = probe_book['bids'][0]['price'] - price_delta
+
+        print(('Asking price:{price:>6}, qty:{qty:>5}...'
+                   .format(qty=crash_qty, price=ask_price)), end='')
+            try:
+                ask = stock_purse.sell(
+                    'limit', qty=crash_qty, price=ask_price)
+            except APIResponseError as e:
+                print(' FAILED {}'.format(print_order_err(e)))
+                break
+
+        time.sleep(wait_before_cancel)
+
+        stock_purse.cancel_all()
+
+        qty_sold = stock_purse.qty_filled(ask.id)
+        print('\nAt round end, sold qty: {}\n              stocks held: {}, basis: {}, NAV: {}.'
+              .format(qty_sold, stock_purse.position(), stock_purse.basis(),
+                      stock_purse.value()))
+
+        time.sleep(wait_after_cancel)
+
+
+def crash_maker(stock_purse, target_price=2000, crash_price_delta=400,
+                crash_qty=400, crash_rest_qty=1200, min_position=-9999,
+                crash_lag=5):
     """Crash the market value of a stock by selling.
 
     One round of crashing works as follows:
@@ -33,45 +87,45 @@ def crash_maker(stock_purse, orig_value=None, num_rounds=30, wait_secs=4, qty_to
       5. Wait `crash_lag` seconds, cancel all orders and go to 1.
 
     If we have cannot place any more asks without sum of position and qty
-    outstanding hitting `min_position`, play shy_maker until we drop to 10%
-    of `max_abs_position`; then continue to crash stock.
-
-    When the price hits `final_perc` of its original price, stop selling and
-    play shy_maker.
+    outstanding hitting `min_position` or when the price hits
+    `target_price`, stop.
     """
 
-    if orig_value is None:
-        # Get the original value
-        pass
-
-    print('')
-    print('######## Crash the stock ########')
-
+    round_num = 0
     min_pos_buffered = min_position + crash_qty + 1
-    while min_pos_buffered < stock_purse.position():
+    ask_price = None
+    while (min_pos_buffered < stock_purse.position() and
+           (ask_price is None or target_price < ask_price)):
 
-        # Get latest bids--we want to pick off the top few
-        probe_book = get_orderbook_bids(
-            stock_purse, max_retries=10, pause=0.6)
+        round_num += 1
+        print('')
+        print('###### Crash the stock, round {} ######'.format(round_num))
+        print('')
+
+        # Get latest bids--we'll start at the top bid
+        probe_book = get_probe_orderbook(
+            stock_purse, max_retries=10, pause=0.6, require_asks=False)
 
         if probe_book is None:
             print('Couldn\'t get a probe orderbook!', end='')
             continue
 
-        ask_price = probe_book['bids'][0]['price'] - crash_price_delta        
-        tot_ask_qty = 0
-        qty_not_instant_filled = 0
+        ask_ids = []
+        ask_price = probe_book['bids'][0]['price'] - crash_price_delta
+        qty_rested = 0
         while (qty_rested < crash_rest_qty and
-               min_pos_buffered < stock_purse.position_with_open_asks()):
-            print(('Bidding price:{price:>6}, qty:{qty:>5}...'
+               min_pos_buffered < stock_purse.position_with_open_asks() and
+               target_price < ask_price):
+            print(('Asking price:{price:>6}, qty:{qty:>5}...'
                    .format(qty=crash_qty, price=ask_price)), end='')
             try:
-                ask = stock_purse.buy(
-                    'limit', qty=crash_qty, price=price)
+                ask = stock_purse.sell(
+                    'limit', qty=crash_qty, price=ask_price)
             except APIResponseError as e:
                 print(' FAILED {}'.format(print_order_err(e)))
                 break
-                
+            
+            ask_ids.append(ask.id)
             print(' OK, filled {} stocks, ID {}'
                   .format(ask.qty_filled(), ask.id))
             qty_rested += ask.qty_resting()
@@ -82,12 +136,17 @@ def crash_maker(stock_purse, orig_value=None, num_rounds=30, wait_secs=4, qty_to
 
         stock_purse.cancel_all()
 
-    #shy_maker()
+        qty_sold = sum(stock_purse.qty_filled(id) for id in ask_ids)
+        print('\nAt round end, sold qty: {}\n              stocks held: {}, basis: {}, NAV: {}.'
+              .format(qty_sold, stock_purse.position(), stock_purse.basis(),
+                      stock_purse.value()))
 
-def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
-              tolerance_adjust=1000, qty_marks=(1000, 2000, 10000, 30000, 50000),
-              price_delta_fallback=400, qtys=(100, 200, 200, 200, 100),
-              informed_qty=10000, informed_penalty=400, dont_stop=True):
+
+
+def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=2000,
+              tolerance_adjust=400, qty_marks=(250, 500, 1000, 2500, 10000, 30000),
+              price_delta_fallback=300, qtys=(50, 200, 200, 200, 300, 300),
+              informed_qty=10000, informed_penalty=400):
     """Every round, get orderbook and make orders with prices based on quantities
     in the orderbook vs. `qty_marks` argument. For example, at qty_mark=(50,),
     one sell order will be issued that round at the price you need to buy the
@@ -110,12 +169,8 @@ def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
         probe_book = get_probe_orderbook(stock_purse, max_retries=10, pause=0.6)
         if probe_book is None:
             print('Couldn\'t get a probe orderbook!', end='')
-            if dont_stop:
-                continue
-            else:
-                print(' Exiting...')
-                return
-
+            continue
+            
         print('')
 
         if any_informed_orders(probe_book, threshold=informed_qty):
@@ -125,10 +180,13 @@ def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
             bid_prices = [max(p - informed_penalty, 0)
                           for p in last_uninformed_bid_prices]
         else:
-            ask_prices = price_till_qty(probe_book['asks'], qty_marks,
-                                        price_delta_fallback, are_bids=False)
-            bid_prices = price_till_qty(probe_book['bids'], qty_marks,
-                                        price_delta_fallback, are_bids=True)
+            ask_prices = price_till_qty(
+                probe_book['asks'], qty_marks, price_delta_fallback,
+                are_bids=False)
+            bid_prices = price_till_qty(
+                probe_book['bids'], qty_marks, price_delta_fallback,
+                are_bids=True)
+
             last_uninformed_ask_prices = ask_prices
             last_uninformed_bid_prices = bid_prices
 
@@ -142,8 +200,8 @@ def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
 
         # Eliminate orders that will put us over the risk quantity limit if
         # filled
-        ask_prices = ask_prices[:idx_cumsum_gt(qtys, 999 + position)]
-        bid_prices = bid_prices[:idx_cumsum_gt(qtys, 999 - position)]
+        ask_prices = ask_prices[:idx_cumsum_gt(qtys, 9999 + position)]
+        bid_prices = bid_prices[:idx_cumsum_gt(qtys, 9999 - position)]
 
         # Send bid orders, lowest first so that the printout is easier to read
         buy_ids = []
@@ -151,14 +209,14 @@ def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
             print(('Bidding price:{price:>6}, qty:{qty:>5}...'
                     .format(qty=qty, price=price)), end='')
             try:
-                buy_resp = stock_purse.buy('limit', qty=qty, price=price)
+                bid = stock_purse.buy('limit', qty=qty, price=price)
             except APIResponseError as e:
-                buy_resp = None
+                bid = None
                 print(' FAILED {}'.format(print_order_err(e)))
             else:
-                buy_ids.append(buy_resp['id'])
+                buy_ids.append(bid.id)
                 print(' OK, filled {} stocks, ID {}'
-                      .format(buy_resp['totalFilled'], buy_resp['id']))
+                      .format(bid.qty_filled(), bid.id))
 
         # Send ask orders
         sell_ids = []
@@ -166,14 +224,14 @@ def shy_maker(stock_purse, num_rounds=30, wait_secs=4, qty_tolerance=400,
             print(('Asking price: {price:>6}, qty:{qty:>5}...'
                     .format(qty=qty, price=price)), end='')
             try:
-                sell_resp = stock_purse.sell('limit', qty=qty, price=price)
+                ask = stock_purse.sell('limit', qty=qty, price=price)
             except APIResponseError as e:
-                sell_resp = None
+                ask = None
                 print(' FAILED {}'.format(print_order_err(e)))
             else:
-                sell_ids.append(sell_resp['id'])
+                sell_ids.append(ask.id)
                 print(' OK, filled {} stocks, ID {}'
-                      .format(sell_resp['totalFilled'], sell_resp['id']))
+                      .format(ask.qty_filled(), ask.id))
 
         time.sleep(wait_secs)
 
@@ -256,7 +314,8 @@ def get_probe_quote(stock_purse, max_retries=10):
     return probe_quote
 
 
-def get_probe_orderbook(stock_purse, max_retries=10, pause=None):
+def get_probe_orderbook(stock_purse, max_retries=10, pause=None,
+                        require_asks=True, require_bids=True):
     probe_orderbook = None
     for attempt in range(max_retries):
         if attempt != 0 and pause is not None:
@@ -270,17 +329,28 @@ def get_probe_orderbook(stock_purse, max_retries=10, pause=None):
         else:
             asks = probe_orderbook['asks']
             bids = probe_orderbook['bids']
+            
             print(' OK, number bids: {}, asks: {}'
                   .format(0 if bids is None else len(bids),
                           0 if asks is None else len(asks)))
-            if asks is None or bids is None or \
-               len(asks) == 0 or len(bids) == 0:
+
+            if require_asks:
+                need_asks = asks is None or len(asks) == 0
+            else:
+                need_asks = False
+            if require_bids:
+                need_bids = bids is None or len(bids) == 0
+            else:
+                need_bids = False
+
+            if need_asks or need_bids:
                 probe_orderbook = None
                 continue
             else:
                 break
 
     return probe_orderbook
+
 
 
 def print_order_err(e):
