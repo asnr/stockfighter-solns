@@ -18,9 +18,9 @@ logging.basicConfig(
     datefmt='%H:%M:%S', level=logging.INFO, filename='logs')
 
 
-account = 'EKB17478089'
-venue = 'ZXMCEX'
-stock = 'WIOM'
+account = 'SMB40471518'
+venue = 'UCDEX'
+stock = 'ZYXI'
 
 init_position = 0
 init_basis = 0
@@ -28,13 +28,13 @@ purse = StockPurse(
     venue, stock, account, position=init_position, basis=init_basis)
 
 
-def slow_buyer(stock_purse, target_position=-6000, qty=300, price_delta=150,
-               wait_before_cancel=5, wait_after_cancel=2):
+def slow_buyer(stock_purse, target_position=-3000, qty=200, price_delta=75,
+               wait_before_cancel=4, wait_after_cancel=5):
     """Try to sell lots of stock before crashing the price.
 
     To not crash the stock, sell `qty` at `price_delta` below top bid
-    on orderbook. Wait `wait_before_cancel`, then cancel, then wait
-    `wait_after_cancel`.
+    on orderbook. Wait `wait_before_cancel` seconds, then cancel, then wait
+    `wait_after_cancel` seconds. Repeat.
 
     Once we hit `target_position`, stop."""
 
@@ -52,13 +52,15 @@ def slow_buyer(stock_purse, target_position=-6000, qty=300, price_delta=150,
         ask_price = probe_book['bids'][0]['price'] - price_delta
 
         print(('Asking price:{price:>6}, qty:{qty:>5}...'
-                   .format(qty=crash_qty, price=ask_price)), end='')
-            try:
-                ask = stock_purse.sell(
-                    'limit', qty=crash_qty, price=ask_price)
-            except APIResponseError as e:
-                print(' FAILED {}'.format(print_order_err(e)))
-                break
+                   .format(qty=qty, price=ask_price)), end='')
+        try:
+            ask = stock_purse.sell(
+                'limit', qty=qty, price=ask_price)
+        except APIResponseError as e:
+            print(' FAILED {}'.format(print_order_err(e)))
+            break
+        else:
+            print(' OK')
 
         time.sleep(wait_before_cancel)
 
@@ -70,6 +72,116 @@ def slow_buyer(stock_purse, target_position=-6000, qty=300, price_delta=150,
                       stock_purse.value()))
 
         time.sleep(wait_after_cancel)
+
+
+def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
+                   crash_qty=250, resting_qty=500, min_position=-7000,
+                   crash_lag=2):
+    """Crash the market value of a stock by steadily decreasing ask
+    prices. It appears that other traders will crash the price if
+    several of their consecutive trades are filled at steadily lower
+    prices. Consequently, once we start crashing the price, we must
+    ensure that other traders *fill every order at a price equal to or
+    less than their previous fill*.
+
+    This strategy has rounds, at no point apart from the end are all
+    outstanding orders cancelled at once, and the rounds should be
+    relatively short. This is so that there is always an ask order
+    resting on the book.
+
+    It works as follows:
+     1. Get the orderbook, first bid price on book is the starting ask price.
+     2. Decrease the ask price by `crash_price_delta`.
+     3. Ask `crash_qty`. Repeat until there is some amount is not
+        filled, i.e. some of the order is left resting on the book.
+     4. Ask `resting_qty`.
+     5. Cancel old asks at price higher than the last ask (we want other
+        traders to always fill at a price no more than their last fill).
+     6. Wait `crash_lag` seconds.
+     7. Go to 2.
+
+    If we will either ask too far below `target_price` or if we are at
+    risk of selling past the `min_position`, then stop selling and
+    cancel all outstanding orders.
+    """
+
+    # Get latest bids--we'll start at the top bid
+    probe_book = get_probe_orderbook(
+        stock_purse, max_retries=12, pause=0.6, require_asks=False)
+
+    if probe_book is None:
+        print('Couldn\'t get a probe orderbook!', end='')
+        return
+
+    ask_price = probe_book['bids'][0]['price']
+
+    round_num = 0
+    min_pos_buffered = min_position + crash_qty + resting_qty + 1
+    last_ask_ids = []
+    # Note we may go one round at a price below `target_price`
+    while (min_pos_buffered < stock_purse.position() and
+           target_price < ask_price):
+        
+        round_num += 1
+        print('')
+        print('###### Crash the stock, round {} ######'.format(round_num))
+        print('')
+
+        ask_price -= crash_price_delta
+
+        # Get some asks resting on the book at `ask_price`
+        ask_ids = []
+        qty_rested = 0
+        while (qty_rested == 0 and
+               min_position < stock_purse.position_with_open_asks() - crash_qty):
+            print(('Asking price:{price:>6}, qty:{qty:>5}...'
+                   .format(qty=crash_qty, price=ask_price)), end='')
+            try:
+                ask = stock_purse.sell(
+                    'limit', qty=crash_qty, price=ask_price)
+            except APIResponseError as e:
+                print(' FAILED {}'.format(print_order_err(e)))
+                break
+            else:
+                print(' OK, filled {} stocks, ID {}'
+                  .format(ask.qty_filled(), ask.id))
+            
+            ask_ids.append(ask.id)
+            
+            qty_rested = ask.qty_resting()
+        
+        # Send the resting order
+        if min_position < stock_purse.position_with_open_asks() - resting_qty:
+            print(('Asking price:{price:>6}, qty:{qty:>5}...'
+                       .format(qty=resting_qty, price=ask_price)), end='')
+            try:
+                ask = stock_purse.sell(
+                    'limit', qty=resting_qty, price=ask_price)
+            except APIResponseError as e:
+                print(' FAILED {}'.format(print_order_err(e)))
+            else:
+                print(' OK, filled {} stocks, ID {}'
+                      .format(ask.qty_filled(), ask.id))
+
+            ask_ids.append(ask.id)
+
+
+        for ask_id in last_ask_ids:
+            stock_purse.cancel(ask_id)
+
+
+        print('\nAt round end, stocks held: {}, basis: {}, NAV: {}.'
+          .format(stock_purse.position(), stock_purse.basis(),
+                  stock_purse.value()))
+
+        time.sleep(crash_lag)
+
+        last_ask_ids = ask_ids
+
+
+    print('\nAt strat end, stocks held: {}, basis: {}, NAV: {}.'
+          .format(stock_purse.position(), stock_purse.basis(),
+                  stock_purse.value()))
 
 
 def crash_maker(stock_purse, target_price=2000, crash_price_delta=400,

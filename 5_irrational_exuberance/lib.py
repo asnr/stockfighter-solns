@@ -332,7 +332,7 @@ class Order:
         return self.qty - self.total_filled
 
     def last_fill_price(self):
-        return self.fills[-1] if len(self.fills) > 0 else None
+        return self.fills[-1]['price'] if len(self.fills) > 0 else None
 
     def update(self, resp_json):
         """Returns 2-tuple: (cost_diff, qty_sent_diff)"""
