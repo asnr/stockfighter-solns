@@ -2,6 +2,7 @@ from __future__ import print_function
 
 import logging
 import requests
+import json
 
 def get_auth_key():
     with open('../AUTH_KEY') as fp:
@@ -83,8 +84,23 @@ class StockPurse:
         self._closed_bids = set()
 
 
+    def __str__(self):
+        ret = '<StockPurse, stocks held: {}, basis: {}'.format(
+            self.position(), self.basis())
+
+        value = self.value()
+        if value is not None:
+            ret += ', NAV: {}'.format(value)
+
+        return ret + '>'
+
+
     def value(self):
-        return self._basis + (self._last_fill_price * self._position)
+        if self._last_fill_price is None:
+            ret = None
+        else:
+            ret = self._basis + (self._last_fill_price * self._position)
+        return ret
 
     def basis(self):
         return self._basis
@@ -267,7 +283,8 @@ class Order:
             print('Response totalFilled {} does not match sum of fill qtys {}. See WARNING in logs.'
                   .format(resp_json['totalFilled'], sum_fill_qtys))
             log_resp = True
-        if resp_json['qty'] != resp_json['originalQty'] - sum_fill_qtys:
+        if (req_type == 'limit' and
+            resp_json['qty'] != resp_json['originalQty'] - sum_fill_qtys):
             print('Response qty {} is not equal to originalQty - sum of fill qtys {}. See WARNING in logs.'
                   .format(resp_json['qty'], resp_json['originalQty'] - sum_fill_qtys))
             log_resp = True

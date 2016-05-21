@@ -18,9 +18,9 @@ logging.basicConfig(
     datefmt='%H:%M:%S', level=logging.INFO, filename='logs')
 
 
-account = 'SMB40471518'
-venue = 'UCDEX'
-stock = 'ZYXI'
+account = 'LAS87930542'
+venue = 'OZEX'
+stock = 'IBS'
 
 init_position = 0
 init_basis = 0
@@ -51,7 +51,7 @@ def slow_buyer(stock_purse, target_position=-3000, qty=200, price_delta=75,
 
         ask_price = probe_book['bids'][0]['price'] - price_delta
 
-        print(('Asking price:{price:>6}, qty:{qty:>5}...'
+        print(('\nAsking price:{price:>6}, qty:{qty:>5}...'
                    .format(qty=qty, price=ask_price)), end='')
         try:
             ask = stock_purse.sell(
@@ -76,7 +76,7 @@ def slow_buyer(stock_purse, target_position=-3000, qty=200, price_delta=75,
 
 def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
                    crash_qty=250, resting_qty=500, min_position=-7000,
-                   crash_lag=2):
+                   crash_lag=2, max_rounds=4):
     """Crash the market value of a stock by steadily decreasing ask
     prices. It appears that other traders will crash the price if
     several of their consecutive trades are filled at steadily lower
@@ -120,7 +120,7 @@ def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
     last_ask_ids = []
     # Note we may go one round at a price below `target_price`
     while (min_pos_buffered < stock_purse.position() and
-           target_price < ask_price):
+           target_price < ask_price and round_num < max_rounds):
         
         round_num += 1
         print('')
@@ -132,8 +132,12 @@ def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
         # Get some asks resting on the book at `ask_price`
         ask_ids = []
         qty_rested = 0
-        while (qty_rested == 0 and
-               min_position < stock_purse.position_with_open_asks() - crash_qty):
+        while qty_rested == 0:
+
+            if stock_purse.position_with_open_asks() - crash_qty < min_position:
+                finish_strat(stock_purse)
+                return
+
             print(('Asking price:{price:>6}, qty:{qty:>5}...'
                    .format(qty=crash_qty, price=ask_price)), end='')
             try:
@@ -151,24 +155,25 @@ def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
             qty_rested = ask.qty_resting()
         
         # Send the resting order
-        if min_position < stock_purse.position_with_open_asks() - resting_qty:
-            print(('Asking price:{price:>6}, qty:{qty:>5}...'
-                       .format(qty=resting_qty, price=ask_price)), end='')
-            try:
-                ask = stock_purse.sell(
-                    'limit', qty=resting_qty, price=ask_price)
-            except APIResponseError as e:
-                print(' FAILED {}'.format(print_order_err(e)))
-            else:
-                print(' OK, filled {} stocks, ID {}'
-                      .format(ask.qty_filled(), ask.id))
+        if stock_purse.position_with_open_asks() - resting_qty < min_position:
+            finish_strat(stock_purse)
+            return
 
-            ask_ids.append(ask.id)
+        print(('Asking price:{price:>6}, qty:{qty:>5}...'
+                   .format(qty=resting_qty, price=ask_price)), end='')
+        try:
+            ask = stock_purse.sell(
+                'limit', qty=resting_qty, price=ask_price)
+        except APIResponseError as e:
+            print(' FAILED {}'.format(print_order_err(e)))
+        else:
+            print(' OK, filled {} stocks, ID {}'
+                  .format(ask.qty_filled(), ask.id))
 
+        ask_ids.append(ask.id)
 
         for ask_id in last_ask_ids:
             stock_purse.cancel(ask_id)
-
 
         print('\nAt round end, stocks held: {}, basis: {}, NAV: {}.'
           .format(stock_purse.position(), stock_purse.basis(),
@@ -179,9 +184,14 @@ def decrease_maker(stock_purse, target_price=2000, crash_price_delta=400,
         last_ask_ids = ask_ids
 
 
+    finish_strat(stock_purse)
+
+
+def finish_strat(stock_purse):
+    stock_purse.cancel_all()
     print('\nAt strat end, stocks held: {}, basis: {}, NAV: {}.'
           .format(stock_purse.position(), stock_purse.basis(),
-                  stock_purse.value()))
+                  stock_purse.value()))    
 
 
 def crash_maker(stock_purse, target_price=2000, crash_price_delta=400,
